@@ -123,6 +123,9 @@ export const DEFAULT_PARAMS: DipParams = {
 };
 
 interface CoinTrack {
+  mint: string;
+  /** First-seen order (insertion order of `coins`); the entry scan order. */
+  seq: number;
   createPrice: number;
   createdSlot: number;
   high: number;
@@ -136,6 +139,13 @@ interface CoinTrack {
   lastBuy: boolean;
   lastPrice: number;
   lastRealSol: number;
+  /**
+   * Cached local entry verdict, recomputed on every touch of this coin.
+   * Exact: a coin's local entry state changes only on its own Create/Trade
+   * events (marks cover held/pending mints only, and those are `entered`,
+   * so they can never be entered again), so the cache is never stale.
+   */
+  local: { tier: 'core' | 'filler' | 'breakout'; sizeSol: number } | null;
 }
 
 interface Held {
@@ -157,125 +167,68 @@ export function createStrategy(p: DipParams): Bot {
   let breakoutEntries = 0;
   let lossStreak = 0;
   let cooloffUntil = -1;
+  let nextSeq = 0;
+  /**
+   * Coins whose cached local verdict is non-null, kept sorted by first-seen
+   * order (seq). The entry scan walks this list instead of the whole `coins`
+   * map: a coin outside it fails a local test, so the old scan would have
+   * skipped it too — same first qualifying coin, same orders. This is the
+   * whole speed fix: the old scan re-ran entryOk (reduces, BigInt math, a
+   * fresh Set allocation per coin in committedPositionCount) over ~1,200
+   * coins on every one of ~63k batches.
+   */
+  const candidates: CoinTrack[] = [];
 
-  function priceOf(state: BotState, mint: string): number | null {
-    const c = state.curves.get(mint);
-    if (!c || c.virtual_token_reserves === 0n) return null;
-    return Number(c.virtual_quote_reserves) / Number(c.virtual_token_reserves);
+  function candIndex(seq: number): number {
+    let lo = 0;
+    let hi = candidates.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (candidates[mid]!.seq < seq) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
   }
 
-  function track(state: BotState, batch: Batch): void {
-    for (const e of batch.events) {
-      if (e.event === 'CreateEvent') {
-        const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
-        coins.set(e.mint, {
-          createPrice: price,
-          createdSlot: e.slot,
-          high: price,
-          dipLow: price,
-          trades: 0,
-          recent: [],
-          recentSol: [],
-          lastBuy: false,
-          lastPrice: price,
-          lastRealSol: 0,
-        });
-      } else if (e.event === 'TradeEvent') {
-        let t = coins.get(e.mint);
-        if (!t) {
-          const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
-          t = {
-            createPrice: price,
-            createdSlot: e.slot,
-            high: price,
-            dipLow: price,
-            trades: 0,
-            recent: [],
-            recentSol: [],
-            lastBuy: false,
-            lastPrice: price,
-            lastRealSol: 0,
-          };
-          coins.set(e.mint, t);
-        }
-        const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
-        t.trades += 1;
-        t.recent.push(e.is_buy);
-        if (t.recent.length > 6) t.recent.shift();
-        t.recentSol.push((e.is_buy ? 1 : -1) * Number(e.sol_amount) / 1e9);
-        if (t.recentSol.length > 6) t.recentSol.shift();
-        t.lastBuy = e.is_buy;
-        t.lastPrice = price;
-        t.lastRealSol = Number(e.real_quote_reserves) / 1e9;
-        if (price > t.high) {
-          t.high = price;
-          t.dipLow = price;
-        } else if (price < t.dipLow) {
-          t.dipLow = price;
-        }
-      } else if (e.event === 'CompleteEvent') {
-        coins.delete(e.mint);
-        held.delete(e.mint);
-      }
-    }
+  function candAdd(t: CoinTrack): void {
+    const i = candIndex(t.seq);
+    if (candidates[i] !== t) candidates.splice(i, 0, t);
   }
 
-  function foldFills(state: BotState, batch: Batch): void {
-    for (const f of batch.fills) {
-      if (f.side === 'sell') {
-        selling.delete(f.mint);
-        const h = held.get(f.mint);
-        if (f.status === 'filled' && h) {
-          const tokens = BigInt(f.token_amount);
-          const proceeds = BigInt(f.quote_lamports);
-          const cost = BigInt(Math.round(h.costPerToken * Number(tokens)));
-          if (proceeds < cost) {
-            lossStreak += 1;
-            if (p.cooloffLosses > 0 && lossStreak >= p.cooloffLosses) {
-              cooloffUntil = batch.slot + p.cooloffSlots;
-              lossStreak = 0;
-            }
-          } else {
-            lossStreak = 0;
-          }
-        }
-      }
-      if (f.status !== 'filled') continue;
-      if (f.side === 'buy') {
-        const tokens = BigInt(f.token_amount);
-        const quote = BigInt(f.quote_lamports);
-        if (tokens > 0n) {
-          held.set(f.mint, {
-            entrySlot: f.slot,
-            costPerToken: Number(quote) / Number(tokens),
-            tier: pendingTier.get(f.client_id) ?? 'core',
-          });
-        }
-        pendingTier.delete(f.client_id);
-      } else {
-        held.delete(f.mint);
-      }
-    }
-    // Positions closed by the harness (complete / flatten) vanish from the account.
-    for (const mint of [...held.keys()]) {
-      if (!state.positions.has(mint)) {
-        held.delete(mint);
-        selling.delete(mint);
-      }
-    }
+  function candRemove(t: CoinTrack): void {
+    const i = candIndex(t.seq);
+    if (candidates[i] === t) candidates.splice(i, 1);
   }
 
-  function entryOk(state: BotState, mint: string, t: CoinTrack): { tier: 'core' | 'filler' | 'breakout'; sizeSol: number } | null {
-    if (entered.has(mint)) return null;
-    if (entries >= p.maxEntries) return null;
-    if (state.committedPositionCount() >= p.maxOpen) return null;
-    for (const pend of state.pending.values()) {
-      if (pend.order.side === 'buy' && pend.order.mint === mint) return null;
-    }
+  function newTrack(mint: string, price: number, slot: number): CoinTrack {
+    return {
+      mint,
+      seq: nextSeq++,
+      createPrice: price,
+      createdSlot: slot,
+      high: price,
+      dipLow: price,
+      trades: 0,
+      recent: [],
+      recentSol: [],
+      lastBuy: false,
+      lastPrice: price,
+      lastRealSol: 0,
+      local: null,
+    };
+  }
+
+  /**
+   * The coin-local half of entryOk, verbatim: every test that depends only
+   * on this coin's own track state and its own curve (maxBuyLamports reads
+   * this mint's real reserves, which move only on its own trades).
+   */
+  function localEntry(
+    state: BotState,
+    mint: string,
+    t: CoinTrack,
+  ): { tier: 'core' | 'filler' | 'breakout'; sizeSol: number } | null {
     if (t.trades < p.minTrades) return null;
-    // Never place a buy the account cannot fund (size + tx fee), so a buy
-    // order is never wasted on an insufficient-cash rejection.
-    if (state.freeCashLamports() < BigInt(Math.round(p.sizeSol * 1e9)) + state.txFeeLamports()) return null;
     const buys = t.recent.reduce((n, b) => n + (b ? 1 : 0), 0);
     const netBuySol = t.recentSol.reduce((n, s) => n + s, 0);
     if (p.requireLastBuy && !t.lastBuy) return null;
@@ -331,6 +284,159 @@ export function createStrategy(p: DipParams): Bot {
     return null;
   }
 
+  /** Recompute one coin's cached local verdict after a touch; entered coins can never re-enter. */
+  function refreshLocal(state: BotState, mint: string, t: CoinTrack): void {
+    if (entered.has(mint)) {
+      t.local = null;
+      candRemove(t);
+      return;
+    }
+    const v = localEntry(state, mint, t);
+    t.local = v;
+    if (v !== null) candAdd(t);
+    else candRemove(t);
+  }
+
+  function priceOf(state: BotState, mint: string): number | null {
+    const c = state.curves.get(mint);
+    if (!c || c.virtual_token_reserves === 0n) return null;
+    return Number(c.virtual_quote_reserves) / Number(c.virtual_token_reserves);
+  }
+
+  function track(state: BotState, batch: Batch): void {
+    for (const e of batch.events) {
+      if (e.event === 'CreateEvent') {
+        const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
+        const t = newTrack(e.mint, price, e.slot);
+        coins.set(e.mint, t);
+        refreshLocal(state, e.mint, t);
+      } else if (e.event === 'TradeEvent') {
+        let t = coins.get(e.mint);
+        if (!t) {
+          const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
+          t = newTrack(e.mint, price, e.slot);
+          coins.set(e.mint, t);
+        }
+        const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
+        t.trades += 1;
+        t.recent.push(e.is_buy);
+        if (t.recent.length > 6) t.recent.shift();
+        t.recentSol.push((e.is_buy ? 1 : -1) * Number(e.sol_amount) / 1e9);
+        if (t.recentSol.length > 6) t.recentSol.shift();
+        t.lastBuy = e.is_buy;
+        t.lastPrice = price;
+        t.lastRealSol = Number(e.real_quote_reserves) / 1e9;
+        if (price > t.high) {
+          t.high = price;
+          t.dipLow = price;
+        } else if (price < t.dipLow) {
+          t.dipLow = price;
+        }
+        refreshLocal(state, e.mint, t);
+      } else if (e.event === 'CompleteEvent') {
+        const t = coins.get(e.mint);
+        if (t !== undefined) candRemove(t);
+        coins.delete(e.mint);
+        held.delete(e.mint);
+      }
+    }
+  }
+
+  function foldFills(state: BotState, batch: Batch): void {
+    for (const f of batch.fills) {
+      if (f.side === 'sell') {
+        selling.delete(f.mint);
+        const h = held.get(f.mint);
+        if (f.status === 'filled' && h) {
+          const tokens = BigInt(f.token_amount);
+          const proceeds = BigInt(f.quote_lamports);
+          const cost = BigInt(Math.round(h.costPerToken * Number(tokens)));
+          if (proceeds < cost) {
+            lossStreak += 1;
+            if (p.cooloffLosses > 0 && lossStreak >= p.cooloffLosses) {
+              cooloffUntil = batch.slot + p.cooloffSlots;
+              lossStreak = 0;
+            }
+          } else {
+            lossStreak = 0;
+          }
+        }
+      }
+      if (f.status !== 'filled') continue;
+      if (f.side === 'buy') {
+        const tokens = BigInt(f.token_amount);
+        const quote = BigInt(f.quote_lamports);
+        if (tokens > 0n) {
+          held.set(f.mint, {
+            entrySlot: f.slot,
+            costPerToken: Number(quote) / Number(tokens),
+            tier: pendingTier.get(f.client_id) ?? 'core',
+          });
+        }
+        pendingTier.delete(f.client_id);
+      } else {
+        held.delete(f.mint);
+      }
+    }
+    // Positions closed by the harness (complete / flatten) vanish from the account.
+    for (const mint of [...held.keys()]) {
+      if (!state.positions.has(mint)) {
+        held.delete(mint);
+        selling.delete(mint);
+      }
+    }
+  }
+
+  /**
+   * Fresh local verdict for a candidate. The cached verdict is exact except
+   * for one input: the tier counters (breakoutEntries / fillerEntries), which
+   * move when another coin is placed. A cached breakout/filler verdict whose
+   * tier has since hit its cap is recomputed here, so the coin falls through
+   * to the dip branch exactly as the uncached test would.
+   */
+  function localNow(
+    state: BotState,
+    mint: string,
+    t: CoinTrack,
+  ): { tier: 'core' | 'filler' | 'breakout'; sizeSol: number } | null {
+    const v = t.local;
+    if (v === null) return null;
+    if (v.tier === 'breakout' && breakoutEntries >= p.breakoutMaxEntries) {
+      const fresh = localEntry(state, mint, t);
+      t.local = fresh;
+      return fresh;
+    }
+    if (v.tier === 'filler' && fillerEntries >= p.fillerMaxEntries) {
+      const fresh = localEntry(state, mint, t);
+      t.local = fresh;
+      return fresh;
+    }
+    return v;
+  }
+
+  /**
+   * Global half of the entry test. The globals in `g` are computed once per
+   * batch: nothing in onBatch mutates state.pending, state.positions or cash
+   * (recordOrders runs after onBatch returns), so they are constant across
+   * the scan — hoisting them out of the per-coin test changes nothing.
+   * The coin-local half is the cached `t.local`, refreshed via localNow.
+   */
+  function entryOk(
+    state: BotState,
+    mint: string,
+    t: CoinTrack,
+    g: { committed: number; freeCash: bigint; pendingBuys: Set<string> },
+  ): { tier: 'core' | 'filler' | 'breakout'; sizeSol: number } | null {
+    if (entered.has(mint)) return null;
+    if (entries >= p.maxEntries) return null;
+    if (g.committed >= p.maxOpen) return null;
+    if (g.pendingBuys.has(mint)) return null;
+    // Never place a buy the account cannot fund (size + tx fee), so a buy
+    // order is never wasted on an insufficient-cash rejection.
+    if (g.freeCash < BigInt(Math.round(p.sizeSol * 1e9)) + state.txFeeLamports()) return null;
+    return localNow(state, mint, t);
+  }
+
   return {
     onBatch(state: BotState, batch: Batch) {
       track(state, batch);
@@ -366,29 +472,50 @@ export function createStrategy(p: DipParams): Bot {
         }
       }
 
-      // Entries: scan coins in first-seen order; up to maxBuysPerBatch per batch.
+      // Entries: scan the candidate list (local-ok coins, first-seen order);
+      // up to maxBuysPerBatch per batch. Same first qualifying coin as
+      // scanning every tracked coin: any coin outside the list fails a local
+      // test, and the globals are identical for every coin in the batch.
       if (batch.slot >= cooloffUntil && entries < p.maxEntries && state.committedPositionCount() < p.maxOpen) {
+        const g = {
+          committed: state.committedPositionCount(),
+          freeCash: state.freeCashLamports(),
+          pendingBuys: new Set(
+            [...state.pending.values()]
+              .filter((pend) => pend.order.side === 'buy')
+              .map((pend) => pend.order.mint),
+          ),
+        };
         let placed = 0;
-        for (const [mint, t] of coins) {
+        for (let ci = 0; ci < candidates.length; ci++) {
           if (placed >= p.maxBuysPerBatch) break;
-          if (state.committedPositionCount() >= p.maxOpen) break;
-          const ok = entryOk(state, mint, t);
-          if (ok) {
-            const cid = `${ok.tier === 'breakout' ? 'brk' : ok.tier === 'filler' ? 'fil' : 'cor'}${entries}`;
-            orders.push({
-              side: 'buy',
-              client_id: cid,
-              mint,
-              quote_lamports: BigInt(Math.round(ok.sizeSol * 1e9)),
-              max_slippage_bps: p.maxSlippageBps,
-            });
-            pendingTier.set(cid, ok.tier);
-            entered.add(mint);
-            entries += 1;
-            if (ok.tier === 'filler') fillerEntries += 1;
-            if (ok.tier === 'breakout') breakoutEntries += 1;
-            placed += 1;
+          if (g.committed >= p.maxOpen) break;
+          const t = candidates[ci]!;
+          const mint = t.mint;
+          const ok = entryOk(state, mint, t, g);
+          if (ok === null) {
+            // Fresh local verdict is null (localNow cleared the stale cache):
+            // this coin cannot qualify until it is touched again.
+            if (t.local === null) {
+              candidates.splice(ci, 1);
+              ci--;
+            }
+            continue;
           }
+          const cid = `${ok.tier === 'breakout' ? 'brk' : ok.tier === 'filler' ? 'fil' : 'cor'}${entries}`;
+          orders.push({
+            side: 'buy',
+            client_id: cid,
+            mint,
+            quote_lamports: BigInt(Math.round(ok.sizeSol * 1e9)),
+            max_slippage_bps: p.maxSlippageBps,
+          });
+          pendingTier.set(cid, ok.tier);
+          entered.add(mint);
+          entries += 1;
+          if (ok.tier === 'filler') fillerEntries += 1;
+          if (ok.tier === 'breakout') breakoutEntries += 1;
+          placed += 1;
         }
       }
 
